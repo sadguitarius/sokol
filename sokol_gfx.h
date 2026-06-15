@@ -5107,6 +5107,10 @@ typedef struct sg_desc {
 // setup and misc functions
 SOKOL_GFX_API_DECL void sg_setup(const sg_desc* desc);
 SOKOL_GFX_API_DECL void sg_shutdown(void);
+SOKOL_GFX_API_DECL void* sg_make_context(void);
+SOKOL_GFX_API_DECL void  sg_set_current_context(void* ctx);
+SOKOL_GFX_API_DECL void* sg_get_current_context(void);
+SOKOL_GFX_API_DECL void  sg_destroy_context(void* ctx);
 SOKOL_GFX_API_DECL bool sg_isvalid(void);
 SOKOL_GFX_API_DECL void sg_reset_state_cache(void);
 SOKOL_GFX_API_DECL sg_trace_hooks sg_install_trace_hooks(const sg_trace_hooks* trace_hooks);
@@ -7333,7 +7337,20 @@ typedef struct {
     #endif
     _sg_commit_listeners_t commit_listeners;
 } _sg_state_t;
-static _sg_state_t _sg;
+#include <stdlib.h>
+#ifndef SOKOL_INSTANCE_THREADLOCAL
+  #if defined(_MSC_VER)
+    #define SOKOL_INSTANCE_THREADLOCAL __declspec(thread)
+  #else
+    #define SOKOL_INSTANCE_THREADLOCAL _Thread_local
+  #endif
+#endif
+static SOKOL_INSTANCE_THREADLOCAL _sg_state_t* _sg_current;
+#define _sg (*_sg_current)
+SOKOL_API_IMPL void* sg_make_context(void) { return calloc(1, sizeof(_sg_state_t)); }
+SOKOL_API_IMPL void  sg_set_current_context(void* ctx) { _sg_current = (_sg_state_t*)ctx; }
+SOKOL_API_IMPL void* sg_get_current_context(void) { return _sg_current; }
+SOKOL_API_IMPL void  sg_destroy_context(void* ctx) { free(ctx); }
 
 // ██       ██████   ██████   ██████  ██ ███    ██  ██████
 // ██      ██    ██ ██       ██       ██ ████   ██ ██

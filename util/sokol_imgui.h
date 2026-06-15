@@ -553,6 +553,10 @@ SOKOL_IMGUI_API_DECL bool simgui_handle_event(const sapp_event* ev);
 SOKOL_IMGUI_API_DECL int simgui_map_keycode(sapp_keycode keycode);  // returns ImGuiKey_*
 #endif
 SOKOL_IMGUI_API_DECL void simgui_shutdown(void);
+SOKOL_IMGUI_API_DECL void* simgui_make_context(void);
+SOKOL_IMGUI_API_DECL void  simgui_set_current_context(void* ctx);
+SOKOL_IMGUI_API_DECL void* simgui_get_current_context(void);
+SOKOL_IMGUI_API_DECL void  simgui_destroy_context(void* ctx);
 
 #ifdef __cplusplus
 } // extern "C"
@@ -647,7 +651,20 @@ typedef struct {
     sg_range indices;
     bool is_osx;
 } _simgui_state_t;
-static _simgui_state_t _simgui;
+#include <stdlib.h>
+#ifndef SOKOL_INSTANCE_THREADLOCAL
+  #if defined(_MSC_VER)
+    #define SOKOL_INSTANCE_THREADLOCAL __declspec(thread)
+  #else
+    #define SOKOL_INSTANCE_THREADLOCAL _Thread_local
+  #endif
+#endif
+static SOKOL_INSTANCE_THREADLOCAL _simgui_state_t* _simgui_current;
+#define _simgui (*_simgui_current)
+SOKOL_API_IMPL void* simgui_make_context(void) { return calloc(1, sizeof(_simgui_state_t)); }
+SOKOL_API_IMPL void  simgui_set_current_context(void* ctx) { _simgui_current = (_simgui_state_t*)ctx; }
+SOKOL_API_IMPL void* simgui_get_current_context(void) { return _simgui_current; }
+SOKOL_API_IMPL void  simgui_destroy_context(void* ctx) { free(ctx); }
 
 //>#shdgen
 #if defined(SOKOL_GLCORE)
