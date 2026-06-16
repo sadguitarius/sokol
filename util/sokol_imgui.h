@@ -553,6 +553,10 @@ SOKOL_IMGUI_API_DECL bool simgui_handle_event(const sapp_event* ev);
 SOKOL_IMGUI_API_DECL int simgui_map_keycode(sapp_keycode keycode);  // returns ImGuiKey_*
 #endif
 SOKOL_IMGUI_API_DECL void simgui_shutdown(void);
+
+// simgui_make_context() creates an independent simgui instance; simgui_set_current_context()
+// selects which one the following calls operate on. These are optional for a single
+// instance: simgui_setup() creates and selects a default context when none is current.
 SOKOL_IMGUI_API_DECL void* simgui_make_context(void);
 SOKOL_IMGUI_API_DECL void  simgui_set_current_context(void* ctx);
 SOKOL_IMGUI_API_DECL void* simgui_get_current_context(void);
@@ -651,9 +655,18 @@ typedef struct {
     sg_range indices;
     bool is_osx;
 } _simgui_state_t;
+// `_simgui_current` points at the current context's state and `_simgui` resolves to it, so
+// all state access goes through the active context. If not using the default context,
+// simgui_set_current_context() must be called on a thread before its first simgui call;
+// `_simgui_current` is null until then.
 #include <stdlib.h>
+// The current-context pointer is thread-local by default, so contexts driven on
+// different threads stay independent. Define SOKOL_INSTANCE_NO_THREADLOCAL to make it a
+// plain global instead when all simgui calls are known to happen on one thread.
 #ifndef SOKOL_INSTANCE_THREADLOCAL
-  #if defined(_MSC_VER)
+  #if defined(SOKOL_INSTANCE_NO_THREADLOCAL)
+    #define SOKOL_INSTANCE_THREADLOCAL
+  #elif defined(_MSC_VER)
     #define SOKOL_INSTANCE_THREADLOCAL __declspec(thread)
   #else
     #define SOKOL_INSTANCE_THREADLOCAL _Thread_local
@@ -2416,6 +2429,10 @@ static void _simgui_update_texture(ImTextureData* tex) {
 //
 // >>public
 SOKOL_API_IMPL void simgui_setup(const simgui_desc_t* desc) {
+#ifndef SOKOL_INSTANCE_NO_DEFAULT_CONTEXT
+    // create and select a default context when none is current
+    if (0 == _simgui_current) { simgui_set_current_context(simgui_make_context()); }
+#endif
     SOKOL_ASSERT(desc);
     _simgui_clear(&_simgui, sizeof(_simgui));
     _simgui.init_cookie = _SIMGUI_INIT_COOKIE;

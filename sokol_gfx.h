@@ -5107,10 +5107,15 @@ typedef struct sg_desc {
 // setup and misc functions
 SOKOL_GFX_API_DECL void sg_setup(const sg_desc* desc);
 SOKOL_GFX_API_DECL void sg_shutdown(void);
+
+// sg_make_context() creates an independent sg instance; sg_set_current_context()
+// selects which one the following calls operate on. These are optional for a single
+// instance: sg_setup() creates and selects a default context when none is current.
 SOKOL_GFX_API_DECL void* sg_make_context(void);
 SOKOL_GFX_API_DECL void  sg_set_current_context(void* ctx);
 SOKOL_GFX_API_DECL void* sg_get_current_context(void);
 SOKOL_GFX_API_DECL void  sg_destroy_context(void* ctx);
+
 SOKOL_GFX_API_DECL bool sg_isvalid(void);
 SOKOL_GFX_API_DECL void sg_reset_state_cache(void);
 SOKOL_GFX_API_DECL sg_trace_hooks sg_install_trace_hooks(const sg_trace_hooks* trace_hooks);
@@ -7337,9 +7342,20 @@ typedef struct {
     #endif
     _sg_commit_listeners_t commit_listeners;
 } _sg_state_t;
+
+// `_sg_current` points at the current context's state and `_sg` resolves to it, so
+// all state access goes through the active context. If not using the default context,
+// sg_set_current_context() must be called on a thread before its first sg call;
+// `_sg_current` is null until then, and a callback running on a foreign thread must not
+// touch `_sg` (see the Metal completion handler).
 #include <stdlib.h>
+// The current-context pointer is thread-local by default, so contexts driven on
+// different threads stay independent. Define SOKOL_INSTANCE_NO_THREADLOCAL to make it a
+// plain global instead when all sokol calls are known to happen on one thread.
 #ifndef SOKOL_INSTANCE_THREADLOCAL
-  #if defined(_MSC_VER)
+  #if defined(SOKOL_INSTANCE_NO_THREADLOCAL)
+    #define SOKOL_INSTANCE_THREADLOCAL
+  #elif defined(_MSC_VER)
     #define SOKOL_INSTANCE_THREADLOCAL __declspec(thread)
   #else
     #define SOKOL_INSTANCE_THREADLOCAL _Thread_local
@@ -16264,6 +16280,8 @@ _SOKOL_PRIVATE void _sg_mtl_begin_pass(const sg_pass* pass, const _sg_attachment
             _sg.mtl.cmd_buffer = [_sg.mtl.cmd_queue commandBufferWithUnretainedReferences];
         }
         [_sg.mtl.cmd_buffer enqueue];
+        // _sg is thread-local and null on the completion thread; keep the semaphore
+        // in a local for the block that runs there.
         dispatch_semaphore_t completion_sem = _sg.mtl.sem;
         [_sg.mtl.cmd_buffer addCompletedHandler:^(id<MTLCommandBuffer> cmd_buf) {
             // NOTE: this code is called on a different thread!
@@ -24780,6 +24798,10 @@ _SOKOL_PRIVATE void _sg_override_portable_limits(void) {
 //
 // >>public
 SOKOL_API_IMPL void sg_setup(const sg_desc* desc) {
+#ifndef SOKOL_INSTANCE_NO_DEFAULT_CONTEXT
+    // create and select a default context when none is current
+    if (0 == _sg_current) { sg_set_current_context(sg_make_context()); }
+#endif
     SOKOL_ASSERT(!_sg.valid);
     SOKOL_ASSERT(desc);
     SOKOL_ASSERT((desc->_start_canary == 0) && (desc->_end_canary == 0));
