@@ -1,5 +1,330 @@
 ## Updates
 
+### 18-Aug-2025
+
+- sokol_gfx_imgui.h: fix a potential buffer overrun when the sokol_gfx.h resource pools
+  are filled up to the last slot, this was caused by off-by-one error when allocating
+  the associated pools on the sokol_gfx_imgui.h side. In general all the related
+  code with pool slot lookups is now much cleaner and robust (like new debug-mode range
+  checks via asserts).
+
+  Ticket: https://github.com/floooh/sokol/issues/1584
+  PR: https://github.com/floooh/sokol/pull/1585
+
+### 17-Aug-2026
+
+- In sokol_gfx.h fixed broken storage image validation (this was a regression from the
+recent write-unsealed update).
+
+  Ticket: https://github.com/floooh/sokol/issues/1583
+
+- sokol_spine.h: fixed a bug in the embedded `sg_shader_desc` struct for D3D11/HLSL
+where the fragment shader uniform block was set to the wrong HLSL bindslot. This
+caused the wrong pre-multiplied-alpha mode to be selected in the shader.
+
+  Ticket: https://github.com/floooh/sokol/issues/1582
+
+Many thanks to @mattiasljungstrom for the detailed bug reports!
+
+### 10-Aug-2026
+
+sokol_gfx.h: in sg_make_pipeline, the decision whether 'vertex attribute
+auto-offset computation' should be performed is now decided separately
+for each vertex buffer slot (see this ticket for details: https://github.com/floooh/sokol/issues/1552).
+
+PR: https://github.com/floooh/sokol/pull/1576
+
+Many thanks to @nihiL7331!
+
+Also note a couple of other minor fixes that happened today:
+
+- sokol_gfx_imgui.h: a deprecated usage of BeginChild has been updated (https://github.com/floooh/sokol/commit/6c3fa5ac6493f4a157f4a8d9740ef0ede1d69ebb)
+- a general bugfix-sweep in sokol_gfx_imgui.h (nothing particularly critical: https://github.com/floooh/sokol/commit/7ecd68d1b8fd0216c06e3a378ffb211745abff0e)
+- in the WebGPU backend, fixed an edge case in the index-buffer bindings cache (the index format wasn't
+  taken in account): https://github.com/floooh/sokol/commit/e309617e1331ac554906d9b3ff79eee59b482c55
+
+Also the sokol-nim bindings and examples are currently being updated for 'Nim-next' (Nimony),
+thanks to @leiserfg for taking care of that!
+
+### 09-Aug-2026
+
+sokol_gfx.h: A new way to populate immutable buffers and images via a new 'unsealed'
+resource state. This is the first step towards a new resource update API which has
+been rolling around in the back of my head for a very long time.
+
+The gist is:
+
+1. Create immutable buffers and images with a new usage flag `desc.usage.write_unsealed = true`
+   and without providing initial data, this will create the resource object in
+   a new resource state `UNSEALED`.
+2. While the resource is in unsealed state, call the following new functions once
+   or multiple times to populate the resource content with data in CPU memory:
+    ```c
+    void sg_write_buffer_unsealed(const sg_write_buffer_desc* desc);
+    void sg_write_image_unsealed(const sg_write_image_desc* desc);
+    ```
+3. When done, 'seal' the resource object so that it can be used in
+   render- or compute-passes, this transitions the resource state from
+   `UNSEALED` to `VALID`:
+    ```c
+    void sg_seal_buffer(sg_buffer buf);
+    void sg_seal_image(sg_image img);
+    ```
+
+These new functions are especially useful to populate large resources from
+smaller pieces because you no longer need to allocate a large intermediate
+chunk of system memory to gather all the data before creating the resource.
+Instead you can create an empty immutable resource upfront and then write
+the initial content piece by piece.
+
+Especially the `sg_write_image_unsealed` function allows much more flexibility
+than before:
+
+- Allows to update subregions of a mipmap, previously only an entire mipmap
+  could be updated at a time
+- The source pixel data no longer has to be packed tightly in memory, but can
+  have a custom row- and slice-pitch.
+
+Trying to bind a resource in `UNSEALED` state is not a hard error but will
+silently skip the next draw- or dispatch-calls while the unsealed resource
+remains bound. This behaviour is in line with other non-`VALID` resource
+states.
+
+For more details, please see the new documentation header section
+`ON POPULATING IMMUTABLE RESOURCES` and the updated inline documentation
+for the new structs `sg_write_buffer_desc` and `sg_write_image_desc`.
+
+The following samples have been updated to use the new functions:
+
+- [vertexindexbuffer-sapp](https://floooh.github.io/sokol-webgpu/vertexindexbuffer-sapp.html): uses `sg_write_buffer_unsealed()`
+  to write the separate vertex- and index-chunks (this one requires a WebGPU capable browser)
+- [cubemap-jpeg-sapp](https://floooh.github.io/sokol-html5/cubemap-jpeg-sapp.html): uses `sg_write_image_unsealed()` to
+  write the loaded cubemap faces separately.
+
+And a new test/sample has been written which allows to tinker with the `sg_write_image_unsealed()`
+functionality, including what the resulting source code would look like:
+
+- [writeimage-sapp](https://floooh.github.io/sokol-html5/writeimage-sapp.html)
+
+Implementation PR: https://github.com/floooh/sokol/pull/1554
+
+Some additional info re the new resource update API:
+
+I have decided to split this into small updates which
+each implement one feature of the new API. In general the new
+API is split into 3 areas, which will be released as incremental
+updates roughly in this order:
+
+- writing CPU-side data to GPU resources
+    - initialize immutable buffers and images via 'write-unsealed' (this update)
+    - write-transient: for writing data that's consumed later
+      in the same frame and doesn't survive into the next frame
+      (replacement for the current `usage.stream_update`)
+    - write-persistent: for writing data into resources that survive
+      until overwritten or the resource is destroyed (replacement
+      for the current `usage.dynamic_update`)
+- copying data between GPU resources:
+    - copy-buffer-to-buffer
+    - copy-buffer-to-image
+    - copy-image-to-image
+    - copy-image-to-buffer
+- reading GPU-side data back into CPU-side memory (most likely
+  asynchronous with a completion callback):
+    - read-buffer
+    - read-image
+
+...and a couple of minor updates:
+
+- in the sokol_app.h vulkan backend, a DebugUtilsMessenger object is now created
+  (in debug build mode) which routes messages from the Vulkan driver and
+  validation layers to the installed sokol-app logging function.
+- the sokol_gfx_imgui.h header has been updated for the new write-unsealed
+  types and functions
+
+### 03-Aug-2026
+
+sokol_app.h vk: Fixed a serious window resizing problem on Linux with NVIDIA drivers. This seems
+to be the only combo which may actually return `VK_ERROR_OUT_OF_DATE_KHR`
+from `vkAcquireNextImageKHR`, and this error path wasn't properly handled before
+(because that error is never triggered on any of my devices).
+
+Many thanks to @PossiblyAShrub reporting and investigating the problem, and for testing the fix!
+
+Issue: https://github.com/floooh/sokol/issues/1564
+PR: https://github.com/floooh/sokol/pull/1565
+
+### 29-Jul-2026
+
+sokol_gfx.h vk: fix a synchronization2 validation layer warning when using a render attachment
+with `SG_LOADACTION_LOAD`.
+
+Ticket: https://github.com/floooh/sokol/issues/1558
+PR: https://github.com/floooh/sokol/pull/1560
+
+Many thanks to @alexschlessinger for the ticket and investigation!
+
+### 25-Jul-2026
+
+sokol_imgui.h has been fixed for Dear ImGui v1.92.9: in the result of `ImGui::GetDrawData()`
+call, the `CmdListsCount` item has been obsoleted in favour of `CmdLists.Size`. The symptom
+is that your UI suddenly comes out blank (e.g. no UI rendered).
+
+Fixed in PR: https://github.com/floooh/sokol/pull/1555
+
+### 19-Jul-2026
+
+sokol_shape.h: some breaking changes:
+
+- it's now possible to omit vertex components (vertex component formats are still
+  hardwired though)
+- new public constants `SSHAPE_MIN_VERTEX_SIZE` and `SSHAPE_MAX_VERTEX_SIZE`
+- some public structs have been removed or renamed to make more sense with the changed behaviour:
+  - `sshape_vertex_t` => removed, since a hardwired struct doesn't make sense anymore with the
+    flexible vertex layout
+  - `sshape_buffer_t` => `sshape_state_t`
+  - `sshape_buffer_item_t` => `sshape_buffer_state_t`
+- the shape-builder functions now modify the 'shape state struct' in place instead of returning
+  a modified copy
+
+Also check the source code of the updated example [shapes-sapp.c](https://floooh.github.io/sokol-html5/shapes-sapp.html)
+
+PR: https://github.com/floooh/sokol/pull/1550
+
+### 15-Jul-2026
+
+sokol_app.h android: added a platform-specific 'native' event callback
+which allows to intercept *all* Android events. See PR https://github.com/floooh/sokol/pull/1551
+for details. Many thanks to @jasonfrowe!
+
+### 08-Jul-2026
+
+sokol_gfx.h gl/gles3: harmonize internal format of depth-stencil textures
+with the other backends to `GL_DEPTH32F_STENCIL8`, **NOTE** though that unlike
+other backends this only affects depth-stencil textures created via sokol_gfx.h,
+the swapchain framebuffers created via sokol_app.h are still limited to
+D24/S8 (this is because the WGL/GLX/NSOpenGL glue libraries don't allow
+to explicitly request a floating point depth buffer).
+
+PR: https://github.com/floooh/sokol/pull/1548
+
+### 07-Jul-2026
+
+sokol_app.h + sokol_gfx.h d3d11: a small udpate which harmonizes the internal
+pixel format for depth-stencil buffers with the Metal, Vulkan and WebGPU backends
+(the internal format has been changed from `DXGI_FORMAT_D24_UNORM_S8_UINT` to
+`DXGI_FORMAT_D32_FLOAT_S8X24_UINT`, e.g. 32-bit float for depth and 8-bit uint
+for stencil). Note that the GL backends currently still use a 24/8 bit
+depth-stencil format.
+
+PR: https://github.com/floooh/sokol/pull/1545
+
+### 02-Jul-2026
+
+The 'advanced swapchain configuration update'!
+
+New sokol_app.h features:
+
+- Better depth-buffer control: it's now finally possible to configure the
+  swapchain without depth buffer, or with a depth buffer without
+  stencil component via the new `sapp_desc.depth_format` struct member. This can
+  be set to `SAPP_PIXELFORMAT_NONE` (no depth buffer),
+  `SAPP_PIXELFORMAT_DEPTH` (depth-only buffer) or
+  `SAPP_PIXELFORMAT_DEPTH_STENCIL` (depth-stencil buffer). The default is
+  `SAPP_PIXELFORMAT_DEPTH` (**NOTE**: previously the default was to create
+  a depth-stencil buffer, so this might be a breaking change for you).
+- SRGB framebuffer support: it's now possible to request an SRGB framebuffer via
+  `sapp_desc.srgb`, this works on all platforms and backends except WebGL2.
+- Experimental HDR support: `sapp_desc.hdr` allows to request an HDR framebuffer.
+  Currently this is only implemented for WebGPU and macOS/iOS+Metal. HDR mode
+  means that the window system glue is configured to display HDR content,
+  and that the framebuffer is using an unnormalized RGBA16F pixel format.
+- Composite mode: allows to request a transparent framebuffer via
+  `sapp_desc.composite_mode = SAPP_COMPOSITEMODE_PREMULTIPLIED`. This is mainly
+  useful on the web to render on top of a webpage. On native platforms currently
+  only macOS+Metal is supported for rendering a transparent window on top of the
+  desktop background.
+- Disable vsync: on some plaform/backend combos it's now possible to disable
+  vsync-throttling via (`sapp_desc.disable_vsync`), this is currently mainly
+  intended as debugging feature to check how fast the per-frame code runs without
+  vsync-throttling.  Disabling vsync is not currently supported on macOS, iOS,
+  Android and the web (mainly because disabling vsync would require a separate
+  code path in those cases, or in case of macOS+GL the feature simply being
+  broken in the GL driver). In the future this will probably be replaced with a proper
+  'presentation mode enum', but this is also tricky because the features and
+  capabilities differ drastically between the various window system glues.
+
+Other sokol_app.h changes and notes:
+
+- A new `sapp_pixel_format` item has been added: `SAPP_PIXELFORMAT_RGBA16F` (used
+  for HDR framebuffers)
+- A new `sapp_composite_mode` enum has been added with two items: `SAPP_COMPOSITEMODE_OPAQUE`
+  and `SAPP_COMPOSITEMODE_PREMULTIPLIED`
+- A new nested struct `sapp_desc.metal` has been added with a boolean `disable_display_sync`.
+  This is wired to `CAMetalLayer.displaySyncEnabled`. Setting `sapp_desc.metal.disable_display_sync` to
+  true has the effect that `CAMetalLayer` doesn't wait for vsync to present the current frame,
+  however vsync-throttling is still in effect via `CADisplayLink` (I spent a couple of days
+  experimenting with removing CADisplayLink, since theoretically it's redundant when CAMetalLayer
+  waits for vsync anyway, but this resulted in a much more jittery frame pacing). Still, disabling
+  `CAMetalLayer.displaySyncEnabled` seems to slightly reduce input-to-screen latency so it
+  made sense to add this very specialized configuration option.
+- **BREAKING**: the `sapp_desc.alpha` struct member has been removed and replaced with `sapp_desc.composite_mode`
+- **BREAKING**: the `sapp_desc.html5.premultiplied_alpha;` struct member has been replaced in favour of `sapp_desc.composite_mode`
+- **BREAKING**: the function `sapp_get_swapchain()` has been renamed to `sapp_acquire_swapchain()`
+  (the new name makes it clearer that this function is only supposed to be called once per
+  frame). Note though that the sokol_glue.h function `sglue_swapchain()` keeps its name, so
+  if you use sokol_app.h together with sokol_glue.h, no code changes are needed
+- Internal code cleanup: the Metal-specific code in the macOS/iOS backends has been unified
+- On macOS+Metal, calling `sapp_acquire_swapchain()` now returns an 'invalid swapchain'
+  when the window is obscured. This then causes all rendering operations in the
+  sokol-gfx swapchain-pass to be skipped (or you may decide to skip the entire pass
+  in the first place by looking at the returned `sapp_swapchain.invalid` boolean)
+- **NOTE**: the `CoreGraphics` framework must now be linked when building for iOS+Metal
+- **NOTE**: on Emscripten+WebGPU be aware of this new-found issue in emdawnwebgpu:
+  https://issues.chromium.org/issues/529689760 (TL;DR: disable the Closure pass for now
+  until this is fixed - it only affects the new experimental HDR feature though)
+- **NOTE**: when vsync is disabled, `sapp_frame_duration()` will return the
+  **unfiltered** frame duration, this is because on some platform/backend combos
+  running with vsync disabled results in very erratic frame pacing (e.g. occasional
+  'long frames' where the frame duration jump from sub-millisecond to multiple milliseconds).
+- **NOTE**: on macOS with the GL backend, `swap_interval` and `disable_vsync` are
+  without effect. This seems to be a bug in the macOS GL implementation going
+  back to macOS 13.
+
+Changes in sokol_gfx.h
+
+- the missing pixel format `SG_PIXELFORMAT_SBGR8A8` has been added (the SRGB variant of BGRA8)
+- two new validation layer checks have been added when creating a `sg_pipeline` object
+  which check that certain depth states are compatible with the expected depth buffer configuration
+  (those trigger when no depth buffer exists but the pipeline state expects one)
+- srgb-related bugfix in the D3D11 backend: MSAA resolve failed in `sg_end_pass()` when
+  rendering into an SRGB+MSAA render attachment
+- new deprecation warnings for Intel Mac specific Metal features in the macOS 27 SDK
+  have been silenced via `#pragma clang diagnostic ignored "-Wno-deprecated-declarations"`
+
+Notable changes in other sokol headers:
+
+- sokol_imgui.h now applies a 'counter-gamma-correction' when rendering into
+  an SRGB framebuffer (this is detected by first looking at `simgui_desc.color_format`,
+  and when this is the default value by looking at `sg_query_desc().environment.defaults.color_format`)
+- in sokol_audio.h an iOS deprecation warning in the iOS 27 SDK about `AVAudioSessionInterruptionType`
+  has been silenced
+
+New and updated sokol samples (note: WebGPU browser support required):
+
+- [srgb-sapp](https://floooh.github.io/sokol-webgpu/srgb-sapp.html): the 'Hello Triangle' into an SRGB framebuffer
+- [srgb-msaa-sapp](https://floooh.github.io/sokol-webgpu/srgb-msaa-sapp.html): same but into an SRGB+MSAA framebuffer
+- [srgb-offscreen-sapp](https://floooh.github.io/sokol-webgpu/srgb-offscreen-sapp.html): test rendering into an
+  SRGB framebuffer with and without MSAA
+- [compositemode-sapp](https://floooh.github.io/sokol-webgpu/compositemode-sapp.html): render a transparent canvas
+  on top of other content (in this case: wikipedia loaded into an iframe), also works on native macOS+Metal just
+  without the webpage (instead the desktop is peaking through)
+- [hdr-sapp](https://floooh.github.io/sokol-webgpu/hdr-sapp.html): test the new HDR framebuffer feature
+  (only tested on Chrome+WebGPU and native macOS+Metal on my MBP)
+- most 2D sokol samples are now configured without a depth buffer (note that sokol_gl.h currently requires
+  a depth buffer even when only rendering 2D content)
+
+PR link: https://github.com/floooh/sokol/pull/1520
+
 ### 11-Jun-2026
 
 - sokol_app.h linux: fixed a long-standing bug in the sokol-app Linux backend

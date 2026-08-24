@@ -137,11 +137,11 @@
     framebuffer with 32-bits per pixel (SFB_FORMAT_RGBA8), use an uint32_t
     buffer like this:
 
-        uint32_t pixels[320][256];
+        uint32_t pixels[256][320];
 
     For the paletted format (1 byte per pixel and a 256 entry color palette):
 
-        uint8_t pixels[320][256];
+        uint8_t pixels[256][320];
         uint32_t palette[256];
 
     ...now 'render' into the pixel and palette buffers with the CPU.
@@ -162,27 +162,27 @@
     Whenever the pixel buffer or color palette content changes, call sfb_update()
     outside a sokol-gfx render pass, and ONLY ONCE PER FRAME at most:
 
-        sfb_update(&(sfb_update_desc){
+        sfb_update(fb, &(sfb_update_desc){
             .pixels = SG_RANGE(pixels),
             .palette = SG_RANGE(palette),
         });
 
     Of course for an RGBA8 framebuffer you'd only provide the pixels:
 
-        sfb_update(&(sfb_update_desc){
+        sfb_update(fb, &(sfb_update_desc){
             .pixels = SG_RANGE(pixels),
         });
 
     ...but even for a paletted framebuffer you can omit the data that doesn't
     change. E.g. when only the palette changes but not the pixel data:
 
-        sfb_update(&(sfb_update_desc){
+        sfb_update(fb, &(sfb_update_desc){
             .palette = SG_RANGE(palette),
         });
 
     ...or vice versa when only the pixels but not the palette entries change:
 
-        sfb_update(&(sfb_update_desc){
+        sfb_update(fb, &(sfb_update_desc){
             .pixels = SG_RANGE(pixels),
         });
 
@@ -337,7 +337,7 @@ typedef struct sfb_framebuffer { uint32_t id; } sfb_framebuffer;
 /*
     sfb_resource_state
 
-    The state of a framebuffer object, obtainable via sfg_query_framebuffer_state().
+    The state of a framebuffer object, obtainable via sfb_query_framebuffer_state().
     Publicly visible values are only SFB_RESOURCESTATE_VALID
     and SFB_RESOURCESTATE_FAILED.
 */
@@ -4680,7 +4680,6 @@ typedef struct {
     int* free_queue;
 } _sfb_pool_t;
 
-#define _SFB_INVALID_SLOT_INDEX (0)
 typedef struct {
     _sfb_pool_t framebuffer_pool;
     _sfb_framebuffer_t* framebuffers;
