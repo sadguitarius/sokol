@@ -502,13 +502,30 @@ SOKOL_IMGUI_API_DECL int simgui_map_keycode(sapp_keycode keycode);  // returns I
 #endif
 SOKOL_IMGUI_API_DECL void simgui_shutdown(void);
 
-// simgui_make_context() creates an independent simgui instance; simgui_set_current_context()
-// selects which one the following calls operate on. These are optional for a single
-// instance: simgui_setup() creates and selects a default context when none is current.
-SOKOL_IMGUI_API_DECL void* simgui_make_context(void);
-SOKOL_IMGUI_API_DECL void  simgui_set_current_context(void* ctx);
-SOKOL_IMGUI_API_DECL void* simgui_get_current_context(void);
-SOKOL_IMGUI_API_DECL void  simgui_destroy_context(void* ctx);
+#if defined(SOKOL_IMGUI_MULTI_CONTEXT)
+// simgui_context: an opaque handle to a separate copy of sokol-imgui's state.
+// simgui_make_context() creates one; simgui_set_context() selects which one
+// the following calls on this thread operate on. A context is driven from
+// one thread at a time; different contexts may run on different threads
+// concurrently.
+//
+// The caller owns a context's lifetime and identity: sokol-imgui keeps no
+// list of its own of which contexts exist, so a handle isn't validated
+// against reuse or double-destruction, the same as a plain malloc'd pointer
+// isn't.
+//
+// These are optional for a single context: simgui_setup() creates and
+// selects a context automatically when none is current, and
+// simgui_shutdown() destroys that context again; a context created
+// explicitly via simgui_make_context() is left alone by simgui_shutdown()
+// and must be destroyed with simgui_destroy_context().
+typedef struct simgui_context_s* simgui_context;
+
+SOKOL_IMGUI_API_DECL simgui_context simgui_make_context(void);
+SOKOL_IMGUI_API_DECL void simgui_set_context(simgui_context ctx);
+SOKOL_IMGUI_API_DECL simgui_context simgui_get_context(void);
+SOKOL_IMGUI_API_DECL void simgui_destroy_context(simgui_context ctx);
+#endif
 
 #ifdef __cplusplus
 } // extern "C"
@@ -601,11 +618,17 @@ typedef struct {
     sg_pipeline pip_unfilterable;
     bool is_osx;
 } _simgui_state_t;
+
+#if defined(SOKOL_IMGUI_MULTI_CONTEXT)
 // `_simgui_current` points at the current context's state and `_simgui` resolves to it, so
 // all state access goes through the active context. If not using the default context,
-// simgui_set_current_context() must be called on a thread before its first simgui call;
-// `_simgui_current` is null until then.
+// simgui_set_context() must be called on a thread before its first simgui call.
+// A thread that hasn't called simgui_set_context() has `_simgui_current` pointing at
+// `_simgui_null_ctx`, an always-invalid (`.init_cookie == 0`) context shared by all
+// threads, so e.g. SOKOL_ASSERT(_SIMGUI_INIT_COOKIE == _simgui.init_cookie) still fails
+// with a normal assertion on that thread instead of segfaulting on `_simgui` itself.
 #include <stdlib.h>
+static _simgui_state_t _simgui_null_ctx;
 // The current-context pointer is thread-local by default, so contexts driven on
 // different threads stay independent. Define SOKOL_INSTANCE_NO_THREADLOCAL to make it a
 // plain global instead when all simgui calls are known to happen on one thread.
@@ -618,12 +641,31 @@ typedef struct {
     #define SOKOL_INSTANCE_THREADLOCAL _Thread_local
   #endif
 #endif
-static SOKOL_INSTANCE_THREADLOCAL _simgui_state_t* _simgui_current;
+static SOKOL_INSTANCE_THREADLOCAL _simgui_state_t* _simgui_current = &_simgui_null_ctx;
+static SOKOL_INSTANCE_THREADLOCAL bool _simgui_current_ctx_owned; // see simgui_setup()/simgui_shutdown()
 #define _simgui (*_simgui_current)
-SOKOL_API_IMPL void* simgui_make_context(void) { return calloc(1, sizeof(_simgui_state_t)); }
-SOKOL_API_IMPL void  simgui_set_current_context(void* ctx) { _simgui_current = (_simgui_state_t*)ctx; }
-SOKOL_API_IMPL void* simgui_get_current_context(void) { return _simgui_current; }
-SOKOL_API_IMPL void  simgui_destroy_context(void* ctx) { free(ctx); }
+// simgui_make_context()'s body lives further down, after _SIMGUI_PANIC/_simgui_log are
+// defined (it's the one context function that can fail and needs to log it)
+SOKOL_API_IMPL void simgui_set_context(simgui_context ctx) {
+    _simgui_current_ctx_owned = false;
+    _simgui_current = ctx ? (_simgui_state_t*)ctx : &_simgui_null_ctx;
+}
+SOKOL_API_IMPL simgui_context simgui_get_context(void) {
+    return (_simgui_current == &_simgui_null_ctx) ? 0 : (simgui_context)_simgui_current;
+}
+SOKOL_API_IMPL void simgui_destroy_context(simgui_context ctx) {
+    if (0 == ctx) {
+        return;
+    }
+    if ((_simgui_state_t*)ctx == _simgui_current) {
+        _simgui_current = &_simgui_null_ctx;
+        _simgui_current_ctx_owned = false;
+    }
+    free(ctx);
+}
+#else
+static _simgui_state_t _simgui;
+#endif // SOKOL_IMGUI_MULTI_CONTEXT
 
 //>#shdgen
 #if defined(SOKOL_GLCORE)
@@ -2396,10 +2438,24 @@ static void _simgui_update_texture(ImTextureData* tex) {
 // ██       ██████  ██████  ███████ ██  ██████
 //
 // >>public
+#if defined(SOKOL_IMGUI_MULTI_CONTEXT)
+SOKOL_API_IMPL simgui_context simgui_make_context(void) {
+    _simgui_state_t* ctx = (_simgui_state_t*)calloc(1, sizeof(_simgui_state_t));
+    if (0 == ctx) {
+        _SIMGUI_PANIC(MALLOC_FAILED);
+    }
+    return (simgui_context)ctx;
+}
+#endif // SOKOL_IMGUI_MULTI_CONTEXT
+
 SOKOL_API_IMPL void simgui_setup(const simgui_desc_t* desc) {
-#ifndef SOKOL_INSTANCE_NO_DEFAULT_CONTEXT
-    // create and select a default context when none is current
-    if (0 == _simgui_current) { simgui_set_current_context(simgui_make_context()); }
+#if defined(SOKOL_IMGUI_MULTI_CONTEXT) && !defined(SOKOL_INSTANCE_NO_DEFAULT_CONTEXT)
+    // create and select a default context when none is current;
+    // simgui_shutdown() destroys it again (see there)
+    if (&_simgui_null_ctx == _simgui_current) {
+        simgui_set_context(simgui_make_context());
+        _simgui_current_ctx_owned = true;
+    }
 #endif
     SOKOL_ASSERT(desc);
     _simgui_clear(&_simgui, sizeof(_simgui));
@@ -2631,6 +2687,13 @@ SOKOL_API_IMPL void simgui_shutdown(void) {
     sg_destroy_buffer(_simgui.vbuf);
     sg_pop_debug_group();
     _simgui.init_cookie = 0;
+#if defined(SOKOL_IMGUI_MULTI_CONTEXT) && !defined(SOKOL_INSTANCE_NO_DEFAULT_CONTEXT)
+    // destroys the context simgui_setup() auto-created; a context created via
+    // simgui_make_context() is left alone
+    if (_simgui_current_ctx_owned) {
+        simgui_destroy_context((simgui_context)_simgui_current);
+    }
+#endif
 }
 
 SOKOL_API_IMPL uint64_t simgui_imtextureid_with_sampler(sg_view tex_view, sg_sampler smp) {
