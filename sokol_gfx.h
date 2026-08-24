@@ -5480,13 +5480,28 @@ typedef struct sg_desc {
 SOKOL_GFX_API_DECL void sg_setup(const sg_desc* desc);
 SOKOL_GFX_API_DECL void sg_shutdown(void);
 
-// sg_make_context() creates an independent sg instance; sg_set_current_context()
-// selects which one the following calls operate on. These are optional for a single
-// instance: sg_setup() creates and selects a default context when none is current.
-SOKOL_GFX_API_DECL void* sg_make_context(void);
-SOKOL_GFX_API_DECL void  sg_set_current_context(void* ctx);
-SOKOL_GFX_API_DECL void* sg_get_current_context(void);
-SOKOL_GFX_API_DECL void  sg_destroy_context(void* ctx);
+#if defined(SOKOL_GFX_MULTI_CONTEXT)
+// sg_context: an opaque handle to a separate copy of sokol-gfx's state, with
+// its own resource pools and backend device. sg_make_context() creates one;
+// sg_set_context() selects which one the following calls on this thread
+// operate on. A context is driven from one thread at a time; different
+// contexts may run on different threads concurrently.
+//
+// The caller owns a context's lifetime and identity: sokol-gfx keeps no list
+// of its own of which contexts exist, so a handle isn't validated against
+// reuse or double-destruction, the same as a plain malloc'd pointer isn't.
+//
+// These are optional for a single context: sg_setup() creates and selects a
+// context automatically when none is current, and sg_shutdown() destroys
+// that context again; a context created explicitly via sg_make_context() is
+// left alone by sg_shutdown() and must be destroyed with sg_destroy_context().
+typedef struct sg_context_s* sg_context;
+
+SOKOL_GFX_API_DECL sg_context sg_make_context(void);
+SOKOL_GFX_API_DECL void sg_set_context(sg_context ctx);
+SOKOL_GFX_API_DECL sg_context sg_get_context(void);
+SOKOL_GFX_API_DECL void sg_destroy_context(sg_context ctx);
+#endif
 
 SOKOL_GFX_API_DECL bool sg_isvalid(void);
 SOKOL_GFX_API_DECL void sg_reset_state_cache(void);
@@ -7731,12 +7746,17 @@ typedef struct {
     _sg_commit_listeners_t commit_listeners;
 } _sg_state_t;
 
+#if defined(SOKOL_GFX_MULTI_CONTEXT)
 // `_sg_current` points at the current context's state and `_sg` resolves to it, so
 // all state access goes through the active context. If not using the default context,
-// sg_set_current_context() must be called on a thread before its first sg call;
-// `_sg_current` is null until then, and a callback running on a foreign thread must not
-// touch `_sg` (see the Metal completion handler).
+// sg_set_context() must be called on a thread before its first sg call.
+// A thread that hasn't called sg_set_context() has `_sg_current` pointing at
+// `_sg_null_ctx`, an always-invalid (`.valid == false`) context shared by all threads,
+// so e.g. SOKOL_ASSERT(_sg.valid) still fails with a normal assertion on that thread
+// instead of segfaulting on `_sg` itself. A callback running on a foreign thread must
+// not touch `_sg` regardless (see the Metal completion handler).
 #include <stdlib.h>
+static _sg_state_t _sg_null_ctx;
 // The current-context pointer is thread-local by default, so contexts driven on
 // different threads stay independent. Define SOKOL_INSTANCE_NO_THREADLOCAL to make it a
 // plain global instead when all sokol calls are known to happen on one thread.
@@ -7749,12 +7769,31 @@ typedef struct {
     #define SOKOL_INSTANCE_THREADLOCAL _Thread_local
   #endif
 #endif
-static SOKOL_INSTANCE_THREADLOCAL _sg_state_t* _sg_current;
+static SOKOL_INSTANCE_THREADLOCAL _sg_state_t* _sg_current = &_sg_null_ctx;
+static SOKOL_INSTANCE_THREADLOCAL bool _sg_current_ctx_owned; // see sg_setup()/sg_shutdown()
 #define _sg (*_sg_current)
-SOKOL_API_IMPL void* sg_make_context(void) { return calloc(1, sizeof(_sg_state_t)); }
-SOKOL_API_IMPL void  sg_set_current_context(void* ctx) { _sg_current = (_sg_state_t*)ctx; }
-SOKOL_API_IMPL void* sg_get_current_context(void) { return _sg_current; }
-SOKOL_API_IMPL void  sg_destroy_context(void* ctx) { free(ctx); }
+// sg_make_context()'s body lives further down, after _SG_PANIC/_sg_log are
+// defined (it's the one context function that can fail and needs to log it)
+SOKOL_API_IMPL void sg_set_context(sg_context ctx) {
+    _sg_current_ctx_owned = false;
+    _sg_current = ctx ? (_sg_state_t*)ctx : &_sg_null_ctx;
+}
+SOKOL_API_IMPL sg_context sg_get_context(void) {
+    return (_sg_current == &_sg_null_ctx) ? 0 : (sg_context)_sg_current;
+}
+SOKOL_API_IMPL void sg_destroy_context(sg_context ctx) {
+    if (0 == ctx) {
+        return;
+    }
+    if ((_sg_state_t*)ctx == _sg_current) {
+        _sg_current = &_sg_null_ctx;
+        _sg_current_ctx_owned = false;
+    }
+    free(ctx);
+}
+#else
+static _sg_state_t _sg;
+#endif // SOKOL_GFX_MULTI_CONTEXT
 
 // ██       ██████   ██████   ██████  ██ ███    ██  ██████
 // ██      ██    ██ ██       ██       ██ ████   ██ ██
@@ -17049,6 +17088,7 @@ _SOKOL_PRIVATE void _sg_mtl_begin_pass(const sg_pass* pass, const _sg_attachment
             _sg.mtl.cmd_buffer = [_sg.mtl.cmd_queue commandBufferWithUnretainedReferences];
         }
         [_sg.mtl.cmd_buffer enqueue];
+        #if defined(SOKOL_GFX_MULTI_CONTEXT)
         // _sg is thread-local and null on the completion thread; keep the semaphore
         // in a local for the block that runs there.
         dispatch_semaphore_t completion_sem = _sg.mtl.sem;
@@ -17057,6 +17097,13 @@ _SOKOL_PRIVATE void _sg_mtl_begin_pass(const sg_pass* pass, const _sg_attachment
             _SOKOL_UNUSED(cmd_buf);
             dispatch_semaphore_signal(completion_sem);
         }];
+        #else
+        [_sg.mtl.cmd_buffer addCompletedHandler:^(id<MTLCommandBuffer> cmd_buf) {
+            // NOTE: this code is called on a different thread!
+            _SOKOL_UNUSED(cmd_buf);
+            dispatch_semaphore_signal(_sg.mtl.sem);
+        }];
+        #endif
     }
 
     // if this is first pass in frame, get uniform buffer base pointer
@@ -26023,10 +26070,24 @@ _SOKOL_PRIVATE void _sg_override_portable_limits(void) {
 // ██       ██████  ██████  ███████ ██  ██████
 //
 // >>public
+#if defined(SOKOL_GFX_MULTI_CONTEXT)
+SOKOL_API_IMPL sg_context sg_make_context(void) {
+    _sg_state_t* ctx = (_sg_state_t*)calloc(1, sizeof(_sg_state_t));
+    if (0 == ctx) {
+        _SG_PANIC(MALLOC_FAILED);
+    }
+    return (sg_context)ctx;
+}
+#endif // SOKOL_GFX_MULTI_CONTEXT
+
 SOKOL_API_IMPL void sg_setup(const sg_desc* desc) {
-#ifndef SOKOL_INSTANCE_NO_DEFAULT_CONTEXT
-    // create and select a default context when none is current
-    if (0 == _sg_current) { sg_set_current_context(sg_make_context()); }
+#if defined(SOKOL_GFX_MULTI_CONTEXT) && !defined(SOKOL_INSTANCE_NO_DEFAULT_CONTEXT)
+    // create and select a default context when none is current;
+    // sg_shutdown() destroys it again (see there)
+    if (&_sg_null_ctx == _sg_current) {
+        sg_set_context(sg_make_context());
+        _sg_current_ctx_owned = true;
+    }
 #endif
     SOKOL_ASSERT(!_sg.valid);
     SOKOL_ASSERT(desc);
@@ -26050,6 +26111,13 @@ SOKOL_API_IMPL void sg_shutdown(void) {
     _sg_discard_commit_listeners();
     _sg_discard_pools(&_sg.pools);
     _SG_CLEAR_ARC_STRUCT(_sg_state_t, _sg);
+#if defined(SOKOL_GFX_MULTI_CONTEXT) && !defined(SOKOL_INSTANCE_NO_DEFAULT_CONTEXT)
+    // destroys the context sg_setup() auto-created; a context created via
+    // sg_make_context() is left alone
+    if (_sg_current_ctx_owned) {
+        sg_destroy_context((sg_context)_sg_current);
+    }
+#endif
 }
 
 SOKOL_API_IMPL bool sg_isvalid(void) {
